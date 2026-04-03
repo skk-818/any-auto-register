@@ -148,6 +148,8 @@ class RefreshTokenRegistrationEngine:
         self._token_acquisition_requires_login: bool = False  # 新注册账号需要二次登录拿 token
         self._post_otp_continue_url: str = ""
         self._post_otp_page_type: str = ""
+        self._verification_code_fetch_max_attempts: int = 3
+        self._verification_code_last_attempt_delay_range: Tuple[int, int] = (1, 5)
 
     def _log(self, message: str, level: str = "info"):
         """记录日志"""
@@ -722,6 +724,66 @@ class RefreshTokenRegistrationEngine:
             self._log(f"正在等待邮箱 {self.email} 的验证码...")
 
             email_id = self.email_info.get("service_id") if self.email_info else None
+            max_attempts = max(int(self._verification_code_fetch_max_attempts or 1), 1)
+            rejected_codes = set()
+
+            for attempt in range(1, max_attempts + 1):
+                exclude_codes = {
+                    str(code).strip()
+                    for code in (self._used_verification_codes | rejected_codes)
+                    if str(code or "").strip()
+                }
+                if exclude_codes:
+                    self._log(
+                        "本轮取件将跳过已取过的验证码: "
+                        + ", ".join(sorted(exclude_codes))
+                    )
+
+                if attempt == max_attempts and max_attempts > 1:
+                    min_delay, max_delay = self._verification_code_last_attempt_delay_range
+                    min_delay = max(int(min_delay or 0), 0)
+                    max_delay = max(int(max_delay or 0), min_delay)
+                    if max_delay > 0:
+                        delay_seconds = min_delay + secrets.randbelow(
+                            max_delay - min_delay + 1
+                        )
+                        if delay_seconds > 0:
+                            self._log(
+                                f"最后一次取码前随机延时 {delay_seconds}s，等待新邮件到达..."
+                            )
+                            time.sleep(delay_seconds)
+
+                code = self.email_service.get_verification_code(
+                    email=self.email,
+                    email_id=email_id,
+                    timeout=30,
+                    pattern=OTP_CODE_PATTERN,
+                    otp_sent_at=self._otp_sent_at,
+                    exclude_codes=exclude_codes,
+                )
+                normalized_code = str(code or "").strip()
+
+                if not normalized_code:
+                    if attempt < max_attempts:
+                        self._log(
+                            f"第 {attempt}/{max_attempts} 次取码未拿到新验证码，继续重试..."
+                        )
+                    continue
+
+                if normalized_code in exclude_codes:
+                    rejected_codes.add(normalized_code)
+                    if attempt < max_attempts:
+                        self._log(
+                            f"收到旧验证码 {normalized_code}，继续等待新邮件（{attempt}/{max_attempts}）..."
+                        )
+                    continue
+
+                self._used_verification_codes.add(normalized_code)
+                self._log(f"成功获取验证码: {normalized_code}")
+                return normalized_code
+
+            self._log(f"等待验证码超时（已重试 {max_attempts} 次）", "error")
+            return None
             exclude_codes = {
                 str(code).strip()
                 for code in self._used_verification_codes
